@@ -27,7 +27,8 @@ try:
 except ImportError as exc:
     raise SystemExit("需要 pywin32 和 Pillow。请运行: pip install pywin32 pillow") from exc
 
-APP_DIR = Path(__file__).resolve().parent
+IS_FROZEN = bool(getattr(sys, "frozen", False))
+APP_DIR = (Path(sys.executable) if IS_FROZEN else Path(__file__)).resolve().parent
 DATA_DIR = APP_DIR / "data"
 PROFILES_DIR = DATA_DIR / "profiles"
 BACKUPS_DIR = DATA_DIR / "backups"
@@ -162,6 +163,10 @@ def associated_icon_location(path: Path) -> str:
 
 
 def launcher_runtime() -> Path:
+    if IS_FROZEN:
+        # A one-file build must launch the EXE itself; __file__ points into
+        # PyInstaller's temporary extraction directory and is not persistent.
+        return Path(sys.executable).resolve()
     pythonw = Path(sys.executable).with_name("pythonw.exe")
     return pythonw if pythonw.exists() else Path(sys.executable)
 
@@ -171,7 +176,10 @@ def configure_launcher(link_path: Path, profile_id: str, icon_location: str) -> 
     shell = Dispatch("WScript.Shell")
     link = shell.CreateShortcut(str(link_path))
     link.Targetpath = str(launcher_runtime())
-    link.Arguments = f'"{Path(__file__).resolve()}" --launch "{profile_id}"'
+    if IS_FROZEN:
+        link.Arguments = f'--launch "{profile_id}"'
+    else:
+        link.Arguments = f'"{Path(__file__).resolve()}" --launch "{profile_id}"'
     link.WorkingDirectory = str(APP_DIR)
     link.Description = ""
     link.WindowStyle = 7
