@@ -49,6 +49,40 @@ def ensure_storage() -> None:
     BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
 
 
+FILE_ATTRIBUTE_HIDDEN = 0x2
+INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
+
+
+def file_attributes(path: Path) -> int | None:
+    """Read Windows file attributes without touching Explorer."""
+    try:
+        value = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+        return None if value == INVALID_FILE_ATTRIBUTES else int(value)
+    except (AttributeError, OSError):
+        return None
+
+
+def set_file_hidden(path: Path, hidden: bool) -> None:
+    """Hide/unhide only the private backup; do not force a desktop refresh."""
+    attrs = file_attributes(path)
+    if attrs is None:
+        return
+    new_attrs = attrs | FILE_ATTRIBUTE_HIDDEN if hidden else attrs & ~FILE_ATTRIBUTE_HIDDEN
+    if new_attrs != attrs and not ctypes.windll.kernel32.SetFileAttributesW(str(path), new_attrs):
+        raise OSError(ctypes.get_last_error(), f"SetFileAttributesW failed: {path}")
+
+
+def restore_file_attributes(path: Path, original: dict) -> None:
+    """Restore attributes captured before a regular file was moved."""
+    attrs = original.get("file_attributes")
+    if isinstance(attrs, int):
+        if not ctypes.windll.kernel32.SetFileAttributesW(str(path), attrs):
+            raise OSError(ctypes.get_last_error(), f"SetFileAttributesW failed: {path}")
+    else:
+        # Profiles created before attribute tracking should still become visible.
+        set_file_hidden(path, False)
+
+
 def file_hash(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -92,6 +126,41 @@ def shortcut_data(path: Path) -> dict:
     }
 
 
+def associated_icon_location(path: Path) -> str:
+    """Return the Windows shell icon used for a regular file.
+
+    A document does not usually contain its own icon; Explorer gets it from the
+    file association (for example WPS for .xlsx).  Saving that resolved icon
+    resource in the generated .lnk prevents the launcher from falling back to
+    the Python icon after the original document is moved to the private backup.
+    """
+    extension = path.suffix.lower()
+    if not extension:
+        return ""
+    try:
+        assoc = ctypes.windll.shlwapi.AssocQueryStringW
+        assoc.argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_wchar_p,
+            ctypes.c_wchar_p,
+            ctypes.c_wchar_p,
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        assoc.restype = ctypes.c_long
+        # ASSOCSTR_DEFAULTICON = 15. First ask for the required buffer size.
+        size = ctypes.c_uint32(0)
+        assoc(0, 15, extension, None, None, ctypes.byref(size))
+        if size.value:
+            buffer = ctypes.create_unicode_buffer(size.value)
+            result = assoc(0, 15, extension, None, buffer, ctypes.byref(size))
+            if result == 0 and buffer.value:
+                return buffer.value
+    except (AttributeError, OSError, TypeError):
+        pass
+    return ""
+
+
 def launcher_runtime() -> Path:
     pythonw = Path(sys.executable).with_name("pythonw.exe")
     return pythonw if pythonw.exists() else Path(sys.executable)
@@ -118,10 +187,20 @@ def shortcut_icon_location(original: dict) -> str:
     """Return a usable icon resource, including the target fallback."""
     icon = (original.get("icon_location") or "").strip()
     # WScript.Shell reports an inherited icon as ",0". Passing that back
-    # Do not force Explorer refresh; avoid desktop flicker.
+    # would make the new launcher inherit the Python icon, so resolve the
+    # target executable instead.
     if (not icon or icon.startswith(",")) and original.get("target"):
         icon = f'{original["target"]},0'
     return icon
+
+
+def verify_launcher(link_path: Path, profile_id: str) -> None:
+    """Fail early if Explorer would still open the original document."""
+    info = shortcut_data(link_path)
+    target = os.path.normcase(os.path.abspath(info.get("target", "")))
+    expected = os.path.normcase(os.path.abspath(str(launcher_runtime())))
+    if target != expected or f'--launch "{profile_id}"' not in info.get("arguments", ""):
+        raise RuntimeError("\u751f\u6210\u7684\u5feb\u6377\u65b9\u5f0f\u672a\u6b63\u786e\u6307\u5411\u84dd\u5c4f\u542f\u52a8\u5668\uff0c\u5df2\u53d6\u6d88\u672c\u6b21\u64cd\u4f5c\u3002")
 
 
 def replace_shortcut(path: Path, profile_id: str, original: dict) -> None:
@@ -129,14 +208,31 @@ def replace_shortcut(path: Path, profile_id: str, original: dict) -> None:
     configure_launcher(path, profile_id, shortcut_icon_location(original))
 
 
-def create_shadow_shortcut(original_path: Path, profile_id: str, icon_source: Path | None = None) -> Path:
+def create_shadow_shortcut(
+    original_path: Path,
+    profile_id: str,
+    icon_source: Path | None = None,
+    icon_location: str = "",
+) -> Path:
     """Create a same-looking launcher beside a moved regular file.
 
-    Windows hides the final .lnk suffix by default, so `report.docx.lnk` is shown as
-    `report.docx` and keeps the document's resolved shell icon.
+    Windows hides the final .lnk suffix by default, so ``report.docx.lnk`` is
+    displayed as ``report.docx``.  Prefer the icon resolved from the original
+    extension association and only fall back to the backup file itself.
     """
     proxy = original_path.with_name(original_path.name + ".lnk")
-    configure_launcher(proxy, profile_id, f"{icon_source or original_path},0")
+    if proxy.exists() and not proxy.is_symlink():
+        # A stale shortcut can safely be replaced, but never overwrite an
+        # unrelated regular file that happens to use the same visible name.
+        try:
+            shortcut_data(proxy)
+        except Exception as exc:
+            raise FileExistsError(
+                f"\u4ee3\u7406\u8def\u5f84\u5df2\u88ab\u5176\u4ed6\u6587\u4ef6\u5360\u7528\uff1a{proxy}"
+            ) from exc
+    icon = icon_location or (f"{icon_source or original_path},0")
+    configure_launcher(proxy, profile_id, icon)
+    verify_launcher(proxy, profile_id)
     return proxy
 
 
@@ -189,6 +285,8 @@ def restore_profile(profile: dict, preserve_current: bool = False) -> tuple[bool
         if source_kind == "file" and proxy.exists():
             proxy.unlink()
         os.replace(temp, destination)
+        if source_kind == "file":
+            restore_file_attributes(destination, profile.get("original", {}))
         profile["restored_at"] = time.time()
         save_profile(profile)
         message = "\u5df2\u6062\u590d\u539f\u59cb\u6587\u4ef6\u3002" if source_kind == "file" else "\u5df2\u6062\u590d\u539f\u59cb\u5feb\u6377\u65b9\u5f0f\u3002"
@@ -587,12 +685,29 @@ class ShortcutManager(TkinterDnD.Tk):
                 proxy_created = True
                 done = "\u5df2\u5907\u4efd\u5e76\u63a5\u7ba1\u5feb\u6377\u65b9\u5f0f"
             else:
+                icon_location = associated_icon_location(path)
+                original_attrs = file_attributes(path)
                 backup = backup_dir / ("original" + path.suffix)
                 shutil.move(str(path), str(backup))
                 moved_original = True
-                profile = {"id": profile_id, "source_kind": "file", "shortcut_path": str(path.with_name(path.name + ".lnk")), "original_path": str(path), "backup_path": str(backup), "original": {"name": path.name}, "created_at": time.time(), "desktop_position": None, **settings}
+                set_file_hidden(backup, True)
+                profile = {
+                    "id": profile_id,
+                    "source_kind": "file",
+                    "shortcut_path": str(path.with_name(path.name + ".lnk")),
+                    "original_path": str(path),
+                    "backup_path": str(backup),
+                    "original": {
+                        "name": path.name,
+                        "icon_location": icon_location,
+                        "file_attributes": original_attrs,
+                    },
+                    "created_at": time.time(),
+                    "desktop_position": None,
+                    **settings,
+                }
                 save_profile(profile)
-                create_shadow_shortcut(path, profile_id, backup)
+                create_shadow_shortcut(path, profile_id, backup, icon_location)
                 proxy_created = True
                 done = "\u5df2\u5907\u4efd\u6587\u4ef6\u5e76\u521b\u5efa\u540c\u56fe\u6807\u84dd\u5c4f\u5feb\u6377\u65b9\u5f0f"
             self.after(0, lambda: self._take_over_done(True, f"{done}\uff1a{path.name}", profile))
@@ -616,6 +731,8 @@ class ShortcutManager(TkinterDnD.Tk):
                     backup = backup_dir / ("original" + path.suffix)
                     if backup.exists() and not path.exists():
                         shutil.move(str(backup), str(path))
+                        if profile.get("original"):
+                            restore_file_attributes(path, profile["original"])
             except OSError as rollback_exc:
                 rollback_errors.append(str(rollback_exc))
             try:
