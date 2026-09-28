@@ -1,0 +1,9 @@
+﻿{
+  "include": ["bsod_shortcut.py", "desktop_icon_positions.py"],
+  "executionEnvironments": [
+    {
+      "root": ".",
+      "extraPaths": ["."]
+    }
+  ]
+}
