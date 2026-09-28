@@ -32,6 +32,8 @@ DATA_DIR = APP_DIR / "data"
 PROFILES_DIR = DATA_DIR / "profiles"
 BACKUPS_DIR = DATA_DIR / "backups"
 
+APP_NAME = "I Need Rest"
+APP_TITLE = "I Need Rest - \u4f2a\u84dd\u5c4f\u6478\u9c7c\u5de5\u5177"
 DEFAULT_HOTKEY = "ctrl+shift+q"
 ACCENT_BLUE = "#0078d7"  # Windows 10 stop-screen blue
 THEMES = {
@@ -138,55 +140,66 @@ def create_shadow_shortcut(original_path: Path, profile_id: str, icon_source: Pa
     return proxy
 
 
-def profile_is_active(profile: dict) -> bool:
-    """Use persisted state for fast polling; do not query Explorer/COM repeatedly.
-
-    The manager refreshes the list periodically. Reading every .lnk through
-    WScript.Shell on the Tk thread was a major source of lag and occasional
-    Explorer stalls. A profile is active until restore_profile records
-    ``restored_at``. Missing files still make it inactive for display.
-    """
-    current = Path(profile.get("shortcut_path", ""))
+def profile_state(profile: dict) -> str:
+    """Return a cheap, filesystem-only health state for a managed item."""
+    if profile.get("restored_at"):
+        return "restored"
     backup = Path(profile.get("backup_path", ""))
-    if not current.exists() or not backup.exists():
-        return False
-    return not bool(profile.get("restored_at"))
+    current = Path(profile.get("shortcut_path", ""))
+    destination = Path(profile.get("original_path", profile.get("shortcut_path", "")))
+    if not backup.exists():
+        return "missing_backup"
+    if profile.get("source_kind", "shortcut") == "file" and destination.exists():
+        return "conflict"
+    if not current.exists():
+        return "missing_proxy"
+    return "active"
 
+
+def profile_is_active(profile: dict) -> bool:
+    return profile_state(profile) == "active"
+
+
+def profile_needs_attention(profile: dict) -> bool:
+    return profile_state(profile) in {"missing_backup", "missing_proxy", "conflict"}
+
+
+def profile_can_restore(profile: dict) -> bool:
+    return profile_state(profile) in {"active", "missing_proxy"}
 
 def restore_profile(profile: dict, preserve_current: bool = False) -> tuple[bool, str]:
     source = Path(profile["backup_path"])
     if not source.exists():
-        return False, "\u627e\u4e0d\u5230\u5907\u4efd\u6587\u4ef6\u3002"
+        return False, "\u627e\u4e0d\u5230\u5907\u4efd\u6587\u4ef6\uff0c\u65e0\u6cd5\u6062\u590d\u3002"
     source_kind = profile.get("source_kind", "shortcut")
     destination = Path(profile.get("original_path", profile["shortcut_path"]))
     proxy = Path(profile["shortcut_path"])
+    temp = destination.with_name(destination.name + ".bsod-restore-tmp")
     try:
         destination.parent.mkdir(parents=True, exist_ok=True)
+        if source_kind == "file" and destination.exists():
+            return False, f"\u6062\u590d\u51b2\u7a81\uff1a\u539f\u4f4d\u5df2\u5b58\u5728\u540c\u540d\u6587\u4ef6\uff1a{destination.name}\uff0c\u8bf7\u5148\u624b\u52a8\u5904\u7406\u3002"
         if preserve_current and proxy.exists():
             stamp = time.strftime("%Y%m%d-%H%M%S")
             conflict = proxy.with_name(f"{proxy.stem} - \u5f53\u524d\u7248\u672c {stamp}{proxy.suffix}")
             shutil.copy2(proxy, conflict)
-
-        if source_kind == "file":
-            # Remove only our launcher; the real file is restored under its original name.
-            if proxy.exists():
-                proxy.unlink()
-            temp = destination.with_name(destination.name + ".bsod-restore-tmp")
-            shutil.copy2(source, temp)
-            os.replace(temp, destination)
-            message = "\u5df2\u6062\u590d\u539f\u59cb\u6587\u4ef6\u3002"
-        else:
-            # Copy through a sibling temporary file avoids leaving a partial shortcut on interruption.
-            temp = destination.with_name(destination.name + ".bsod-restore-tmp")
-            shutil.copy2(source, temp)
-            os.replace(temp, destination)
-            message = "\u5df2\u6062\u590d\u539f\u59cb\u5feb\u6377\u65b9\u5f0f\u3002"
+        if temp.exists():
+            temp.unlink()
+        shutil.copy2(source, temp)
+        if source_kind == "file" and proxy.exists():
+            proxy.unlink()
+        os.replace(temp, destination)
         profile["restored_at"] = time.time()
         save_profile(profile)
+        message = "\u5df2\u6062\u590d\u539f\u59cb\u6587\u4ef6\u3002" if source_kind == "file" else "\u5df2\u6062\u590d\u539f\u59cb\u5feb\u6377\u65b9\u5f0f\u3002"
         return True, message
     except OSError as exc:
+        try:
+            if temp.exists():
+                temp.unlink()
+        except OSError:
+            pass
         return False, f"\u6062\u590d\u5931\u8d25\uff1a{exc}"
-
 
 def normalize_hotkey(value: str) -> str:
     value = value.strip().lower().replace(" ", "")
@@ -392,7 +405,7 @@ class ShortcutManager(TkinterDnD.Tk):
     def __init__(self):
         super().__init__()
         ensure_storage()
-        self.title("蓝屏快捷方式")
+        self.title(APP_TITLE)
         self.resizable(False, False)
         self.configure(padx=14, pady=14)
         self.selected_path = tk.StringVar()
@@ -405,11 +418,12 @@ class ShortcutManager(TkinterDnD.Tk):
         self.build_ui()
         self.enable_drag_drop()
         self.refresh_profiles()
+        self.after(250, self.check_startup_profiles)
         # The blue-screen launcher restores files in a separate process.
         self.after(1500, self.auto_refresh_profiles)
 
     def build_ui(self) -> None:
-        header = ttk.Label(self, text="蓝屏快捷方式", font=("Segoe UI", 13, "bold"))
+        header = ttk.Label(self, text=APP_NAME, font=("Segoe UI", 13, "bold"))
         header.grid(row=0, column=0, columnspan=3, sticky="w")
         ttk.Label(self, text="本地视觉模拟；不触发真实系统蓝屏。", foreground="#555555").grid(
             row=1, column=0, columnspan=3, sticky="w", pady=(1, 10))
@@ -551,36 +565,72 @@ class ShortcutManager(TkinterDnD.Tk):
         threading.Thread(target=self._take_over_task, args=(path, is_shortcut, settings), daemon=True).start()
 
     def _take_over_task(self, path: Path, is_shortcut: bool, settings: dict) -> None:
-        # pywin32 COM objects are apartment-bound; initialize COM in this
-        # background thread before reading or writing .lnk properties.
         pythoncom.CoInitialize()
+        profile_id = uuid.uuid4().hex
+        backup_dir = BACKUPS_DIR / profile_id
+        profile: dict | None = None
+        moved_original = False
+        proxy_created = False
         try:
             for existing in all_profiles():
                 if Path(existing.get("original_path", existing.get("shortcut_path", ""))) == path and profile_is_active(existing):
                     raise RuntimeError("\u8fd9\u4e2a\u6587\u4ef6\u5df2\u7ecf\u5904\u4e8e\u84dd\u5c4f\u6a21\u5f0f\u3002")
-            profile_id = uuid.uuid4().hex
-    # Do not force Explorer refresh; avoid desktop flicker.
-            desktop_position = None
-            backup_dir = BACKUPS_DIR / profile_id
+            # Do not scan desktop icon positions; keep Explorer communication minimal.
             backup_dir.mkdir(parents=True)
             if is_shortcut:
                 original = shortcut_data(path)
                 backup = backup_dir / "original.lnk"
                 shutil.copy2(path, backup)
-                profile = {"id": profile_id, "source_kind": "shortcut", "shortcut_path": str(path), "original_path": str(path), "backup_path": str(backup), "original": original, "created_at": time.time(), "desktop_position": desktop_position, **settings}
+                profile = {"id": profile_id, "source_kind": "shortcut", "shortcut_path": str(path), "original_path": str(path), "backup_path": str(backup), "original": original, "created_at": time.time(), "desktop_position": None, **settings}
                 save_profile(profile)
                 replace_shortcut(path, profile_id, original)
+                proxy_created = True
                 done = "\u5df2\u5907\u4efd\u5e76\u63a5\u7ba1\u5feb\u6377\u65b9\u5f0f"
             else:
                 backup = backup_dir / ("original" + path.suffix)
                 shutil.move(str(path), str(backup))
-                profile = {"id": profile_id, "source_kind": "file", "shortcut_path": str(path.with_name(path.name + ".lnk")), "original_path": str(path), "backup_path": str(backup), "original": {"name": path.name}, "created_at": time.time(), "desktop_position": desktop_position, **settings}
+                moved_original = True
+                profile = {"id": profile_id, "source_kind": "file", "shortcut_path": str(path.with_name(path.name + ".lnk")), "original_path": str(path), "backup_path": str(backup), "original": {"name": path.name}, "created_at": time.time(), "desktop_position": None, **settings}
                 save_profile(profile)
                 create_shadow_shortcut(path, profile_id, backup)
+                proxy_created = True
                 done = "\u5df2\u5907\u4efd\u6587\u4ef6\u5e76\u521b\u5efa\u540c\u56fe\u6807\u84dd\u5c4f\u5feb\u6377\u65b9\u5f0f"
             self.after(0, lambda: self._take_over_done(True, f"{done}\uff1a{path.name}", profile))
         except Exception as exc:
-            error_text = str(exc)
+            rollback_errors = []
+            try:
+                if profile and profile.get("source_kind") == "shortcut":
+                    backup = Path(profile["backup_path"])
+                    destination = Path(profile["original_path"])
+                    temp = destination.with_name(destination.name + ".bsod-rollback-tmp")
+                    if backup.exists():
+                        if temp.exists():
+                            temp.unlink()
+                        shutil.copy2(backup, temp)
+                        os.replace(temp, destination)
+                elif profile:
+                    proxy = Path(profile["shortcut_path"])
+                    if proxy.exists():
+                        proxy.unlink()
+                if moved_original:
+                    backup = backup_dir / ("original" + path.suffix)
+                    if backup.exists() and not path.exists():
+                        shutil.move(str(backup), str(path))
+            except OSError as rollback_exc:
+                rollback_errors.append(str(rollback_exc))
+            try:
+                profile_file = PROFILES_DIR / f"{profile_id}.json"
+                if profile_file.exists():
+                    profile_file.unlink()
+                if backup_dir.exists():
+                    shutil.rmtree(backup_dir)
+            except OSError as cleanup_exc:
+                rollback_errors.append(str(cleanup_exc))
+            error_text = f"\u521b\u5efa\u5931\u8d25\uff1a{exc}"
+            if rollback_errors:
+                error_text += "\n\n\u56de\u6eda\u65f6\u9047\u5230\u95ee\u9898\uff1a" + "\n".join(rollback_errors)
+            else:
+                error_text += "\n\n\u5df2\u5c1d\u8bd5\u6062\u590d\u539f\u6587\u4ef6\u3002"
             self.after(0, lambda text=error_text: self._take_over_done(False, text, None))
         finally:
             pythoncom.CoUninitialize()
@@ -612,19 +662,21 @@ class ShortcutManager(TkinterDnD.Tk):
         profile = self.selected_profile()
         if not profile:
             return
-        active = profile_is_active(profile)
-        preserve = False
-        if not active:
-            answer = messagebox.askyesnocancel(
-                "\u68c0\u6d4b\u5230\u4fee\u6539",
-                "\u5f53\u524d\u5feb\u6377\u65b9\u5f0f\u4e0d\u662f\u672c\u5de5\u5177\u751f\u6210\u7684\u84dd\u5c4f\u5feb\u6377\u65b9\u5f0f\u3002\n\n\u662f\uff1a\u4fdd\u7559\u5f53\u524d\u7248\u672c\u7684\u526f\u672c\u540e\u6062\u590d\u5907\u4efd\n\u5426\uff1a\u76f4\u63a5\u7528\u5907\u4efd\u8986\u76d6\n\u53d6\u6d88\uff1a\u4e0d\u6062\u590d",
+        state = profile_state(profile)
+        if state == "restored":
+            messagebox.showinfo("\u5df2\u6062\u590d", "\u8fd9\u4e2a\u9879\u76ee\u5df2\u7ecf\u6062\u590d\u3002", parent=self)
+            return
+        if not profile_can_restore(profile):
+            messagebox.showerror(
+                "\u65e0\u6cd5\u6062\u590d",
+                "\u8fd9\u4e2a\u9879\u76ee\u5b58\u5728\u5f02\u5e38\uff1a" + profile_state(profile) + "\u3002\n\n\u8bf7\u5148\u5904\u7406\u6587\u4ef6\u51b2\u7a81\u6216\u8865\u56de\u5907\u4efd\u6587\u4ef6\u3002",
                 parent=self,
             )
-            if answer is None:
-                return
-            preserve = bool(answer)
+            return
+        if not messagebox.askyesno("\u6062\u590d\u9879\u76ee", "\u5c06\u6062\u590d\u8fd9\u4e2a\u9879\u76ee\u5e76\u4fdd\u7559\u5907\u4efd\u3002\u662f\u5426\u7ee7\u7eed\uff1f", parent=self):
+            return
         self._set_busy(True, "\u6b63\u5728\u6062\u590d\uff0c\u8bf7\u7a0d\u5019\u2026")
-        threading.Thread(target=self._restore_task, args=(profile, preserve), daemon=True).start()
+        threading.Thread(target=self._restore_task, args=(profile, False), daemon=True).start()
 
     def _restore_task(self, profile: dict, preserve: bool) -> None:
         result = restore_profile(profile, preserve)
@@ -641,14 +693,19 @@ class ShortcutManager(TkinterDnD.Tk):
     def restore_all(self) -> None:
         if getattr(self, "_busy", False):
             return
-        active = [p for p in all_profiles() if profile_is_active(p)]
-        if not active:
-            messagebox.showinfo("\u6ca1\u6709\u9700\u8981\u6062\u590d\u7684\u9879\u76ee", "\u5f53\u524d\u6ca1\u6709\u5904\u4e8e\u84dd\u5c4f\u6a21\u5f0f\u7684\u5feb\u6377\u65b9\u5f0f\u3002", parent=self)
+        profiles = all_profiles()
+        candidates = [p for p in profiles if profile_can_restore(p)]
+        blocked = [p for p in profiles if not p.get("restored_at") and not profile_can_restore(p)]
+        if not candidates:
+            messagebox.showinfo("\u6ca1\u6709\u53ef\u6062\u590d\u9879\u76ee", "\u5f53\u524d\u6ca1\u6709\u53ef\u81ea\u52a8\u6062\u590d\u7684\u9879\u76ee\u3002", parent=self)
             return
-        if not messagebox.askyesno("\u6062\u590d\u5168\u90e8", f"\u5c06\u6062\u590d {len(active)} \u4e2a\u5feb\u6377\u65b9\u5f0f\u3002\u662f\u5426\u7ee7\u7eed\uff1f", parent=self):
+        warning = f"\u5c06\u5c1d\u8bd5\u6062\u590d {len(candidates)} \u4e2a\u9879\u76ee\u3002"
+        if blocked:
+            warning += f"\n\n\u53e6\u6709 {len(blocked)} \u4e2a\u9879\u76ee\u5b58\u5728\u5f02\u5e38\uff0c\u4e0d\u4f1a\u88ab\u5f3a\u5236\u8986\u76d6\u3002"
+        if not messagebox.askyesno("\u6062\u590d\u5168\u90e8", warning + "\n\n\u662f\u5426\u7ee7\u7eed\uff1f", parent=self):
             return
         self._set_busy(True, "\u6b63\u5728\u6062\u590d\u5168\u90e8\u9879\u76ee\uff0c\u8bf7\u7a0d\u5019\u2026")
-        threading.Thread(target=self._restore_all_task, args=(active,), daemon=True).start()
+        threading.Thread(target=self._restore_all_task, args=(candidates,), daemon=True).start()
 
     def _restore_all_task(self, profiles: list[dict]) -> None:
         count = 0
@@ -668,23 +725,75 @@ class ShortcutManager(TkinterDnD.Tk):
             messagebox.showerror("\u6062\u590d\u5931\u8d25", "\n".join(errors), parent=self)
 
     def refresh_profiles(self) -> None:
-        labels = {"once": "一次后恢复", "after": "结束后恢复", "manual": "手动恢复"}
+        labels = {"once": "\u4e00\u6b21\u540e\u6062\u590d", "after": "\u7ed3\u675f\u540e\u6062\u590d", "manual": "\u624b\u52a8\u6062\u590d"}
+        state_labels = {
+            "active": "\u84dd\u5c4f\u4e2d",
+            "restored": "\u5df2\u6062\u590d",
+            "missing_backup": "\u5907\u4efd\u4e22\u5931",
+            "missing_proxy": "\u4ee3\u7406\u4e22\u5931",
+            "conflict": "\u6709\u6587\u4ef6\u51b2\u7a81",
+        }
         rows = []
         for profile in all_profiles():
-            active = profile_is_active(profile)
-            name = Path(profile.get("shortcut_path", "未知")).name
-            rows.append((profile["id"], name, profile.get("restore_mode"), active))
+            state = profile_state(profile)
+            name = Path(profile.get("shortcut_path", "\u672a\u77e5")).name
+            rows.append((profile["id"], name, profile.get("restore_mode"), state))
         signature = tuple(rows)
         if signature == getattr(self, "_profile_signature", None):
             return
         self._profile_signature = signature
         for item in self.tree.get_children():
             self.tree.delete(item)
-        for profile_id, name, mode, active in rows:
+        for profile_id, name, mode, state in rows:
             self.tree.insert(
                 "", "end", iid=profile_id,
-                values=(name, labels.get(mode, "未知"), "蓝屏中" if active else "已恢复"),
+                values=(name, labels.get(mode, "\u672a\u77e5"), state_labels.get(state, "\u672a\u77e5")),
             )
+
+    def check_startup_profiles(self) -> None:
+        """Find incomplete records left by a crash or interrupted operation."""
+        attention = [profile for profile in all_profiles() if profile_needs_attention(profile)]
+        if not attention:
+            return
+        names = []
+        for profile in attention[:5]:
+            name = Path(profile.get("original_path", profile.get("shortcut_path", "\u672a\u77e5"))).name
+            names.append(f"- {name}: {profile_state(profile)}")
+        more = "" if len(attention) <= 5 else f"\n...\u8fd8\u6709 {len(attention) - 5} \u4e2a\u9879\u76ee"
+        prompt = (
+            f"\u68c0\u6d4b\u5230 {len(attention)} \u4e2a\u9879\u76ee\u53ef\u80fd\u5728\u4e0a\u6b21\u64cd\u4f5c\u4e2d\u672a\u5b8c\u6210\u3002\n\n"
+            + "\n".join(names)
+            + more
+            + "\n\n\u662f\u5426\u7acb\u5373\u5c1d\u8bd5\u6062\u590d\uff1f"
+        )
+        if not messagebox.askyesno("\u68c0\u6d4b\u5230\u672a\u5b8c\u6210\u9879\u76ee", prompt, parent=self):
+            self.status.set("\u5df2\u53d1\u73b0\u672a\u5b8c\u6210\u9879\u76ee\uff0c\u8bf7\u5728\u5217\u8868\u4e2d\u68c0\u67e5\u3002")
+            return
+        candidates = [profile for profile in attention if profile_can_restore(profile)]
+        if not candidates:
+            self.status.set("\u53d1\u73b0\u5f02\u5e38\u9879\u76ee\uff0c\u4f46\u6ca1\u6709\u53ef\u81ea\u52a8\u6062\u590d\u7684\u5907\u4efd\u3002")
+            return
+        self._set_busy(True, "\u6b63\u5728\u68c0\u67e5\u5e76\u6062\u590d\u672a\u5b8c\u6210\u9879\u76ee\uff0c\u8bf7\u7a0d\u5019\u2026")
+        threading.Thread(target=self._startup_recovery_task, args=(candidates,), daemon=True).start()
+
+    def _startup_recovery_task(self, profiles: list[dict]) -> None:
+        count = 0
+        errors = []
+        for profile in profiles:
+            ok, text = restore_profile(profile)
+            count += int(ok)
+            if not ok:
+                errors.append(text)
+        self.after(0, lambda: self._startup_recovery_done(count, errors))
+
+    def _startup_recovery_done(self, count: int, errors: list[str]) -> None:
+        self._set_busy(False)
+        self.refresh_profiles()
+        if errors:
+            self.status.set(f"\u5df2\u6062\u590d {count} \u4e2a\u9879\u76ee\uff0c\u4ecd\u6709 {len(errors)} \u4e2a\u9879\u76ee\u9700\u8981\u5904\u7406\u3002")
+            messagebox.showwarning("\u6062\u590d\u68c0\u67e5\u5b8c\u6210", "\n".join(errors), parent=self)
+        else:
+            self.status.set(f"\u542f\u52a8\u68c0\u67e5\u5b8c\u6210\uff0c\u5df2\u6062\u590d {count} \u4e2a\u9879\u76ee\u3002")
 
     def auto_refresh_profiles(self) -> None:
         self.refresh_profiles()
@@ -706,57 +815,58 @@ class ShortcutManager(TkinterDnD.Tk):
         profile = self.selected_profile()
         if not profile:
             return
-        active = profile_is_active(profile)
-        if active:
-            answer = messagebox.askyesno(
-                "项目尚未恢复",
-                "这个项目仍处于蓝屏模式。\n\n删除记录前会先自动恢复原快捷方式，是否继续？",
-                parent=self,
-            )
-            if not answer:
+        state = profile_state(profile)
+        if state != "restored":
+            if not profile_can_restore(profile):
+                messagebox.showerror("\u65e0\u6cd5\u5220\u9664", "\u8fd9\u4e2a\u9879\u76ee\u5b58\u5728\u5f02\u5e38\uff0c\u8bf7\u5148\u89e3\u51b3\u6062\u590d\u95ee\u9898\u3002", parent=self)
+                return
+            if not messagebox.askyesno("\u9879\u76ee\u5c1a\u672a\u6062\u590d", "\u5220\u9664\u8bb0\u5f55\u524d\u4f1a\u5148\u81ea\u52a8\u6062\u590d\u539f\u6587\u4ef6\uff0c\u662f\u5426\u7ee7\u7eed\uff1f", parent=self):
                 return
             ok, text = restore_profile(profile)
             if not ok:
-                messagebox.showerror("恢复失败", f"删除已取消：\n{text}", parent=self)
+                messagebox.showerror("\u6062\u590d\u5931\u8d25", f"\u5220\u9664\u5df2\u53d6\u6d88\uff1a\n{text}", parent=self)
                 return
-        elif not messagebox.askyesno("删除记录", "删除后将同时删除该项目的备份记录，是否继续？", parent=self):
+        elif not messagebox.askyesno("\u5220\u9664\u8bb0\u5f55", "\u5220\u9664\u540e\u5c06\u540c\u65f6\u5220\u9664\u8be5\u9879\u76ee\u7684\u5907\u4efd\u8bb0\u5f55\uff0c\u662f\u5426\u7ee7\u7eed\uff1f", parent=self):
             return
         try:
             self.delete_profile_record(profile)
-            self.status.set("已删除记录：{}".format(Path(profile.get("shortcut_path", "未知")).name))
+            self.status.set("\u5df2\u5220\u9664\u8bb0\u5f55\uff1a{}".format(Path(profile.get("shortcut_path", "\u672a\u77e5")).name))
             self.refresh_profiles()
         except OSError as exc:
-            messagebox.showerror("删除失败", str(exc), parent=self)
+            messagebox.showerror("\u5220\u9664\u5931\u8d25", str(exc), parent=self)
 
     def delete_all_records(self) -> None:
         profiles = all_profiles()
         if not profiles:
-            messagebox.showinfo("没有记录", "当前没有可删除的记录。", parent=self)
+            messagebox.showinfo("\u6ca1\u6709\u8bb0\u5f55", "\u5f53\u524d\u6ca1\u6709\u53ef\u5220\u9664\u7684\u8bb0\u5f55\u3002", parent=self)
             return
-        active = [profile for profile in profiles if profile_is_active(profile)]
-        warning = (
-            f"共有 {len(profiles)} 条记录。\n"
-            f"其中 {len(active)} 条尚未恢复。\n\n"
-            "删除前会自动恢复尚未恢复的项目，然后删除全部备份和记录。\n\n是否继续？"
-        )
-        if not messagebox.askyesno("清理全部记录", warning, parent=self):
+        pending = [p for p in profiles if not p.get("restored_at")]
+        blocked = [p for p in pending if not profile_can_restore(p)]
+        warning = f"\u5171\u6709 {len(profiles)} \u6761\u8bb0\u5f55\u3002\n\u5176\u4e2d {len(pending)} \u6761\u5c1a\u672a\u6062\u590d\u3002"
+        if blocked:
+            warning += f"\n\u6709 {len(blocked)} \u6761\u5b58\u5728\u5f02\u5e38\uff0c\u9700\u8981\u5148\u624b\u52a8\u5904\u7406\u3002"
+        warning += "\n\n\u5220\u9664\u524d\u4f1a\u81ea\u52a8\u6062\u590d\u53ef\u6062\u590d\u7684\u9879\u76ee\uff0c\u7136\u540e\u5220\u9664\u8bb0\u5f55\u3002\n\n\u662f\u5426\u7ee7\u7eed\uff1f"
+        if not messagebox.askyesno("\u6e05\u7406\u5168\u90e8\u8bb0\u5f55", warning, parent=self):
+            return
+        if blocked:
+            messagebox.showerror("\u65e0\u6cd5\u6e05\u7406", "\u5b58\u5728\u672a\u89e3\u51b3\u7684\u5f02\u5e38\u9879\u76ee\uff0c\u4e3a\u907f\u514d\u4e22\u5931\u5907\u4efd\uff0c\u5df2\u53d6\u6d88\u6e05\u7406\u3002", parent=self)
             return
         errors = []
-        for profile in active:
+        for profile in pending:
             ok, text = restore_profile(profile)
             if not ok:
                 errors.append(text)
         if errors:
-            messagebox.showerror("恢复失败", "有项目未能恢复，已取消删除。\n\n" + "\n".join(errors), parent=self)
+            messagebox.showerror("\u6062\u590d\u5931\u8d25", "\u6709\u9879\u76ee\u672a\u80fd\u6062\u590d\uff0c\u5df2\u53d6\u6d88\u5220\u9664\u3002\n\n" + "\n".join(errors), parent=self)
             self.refresh_profiles()
             return
         try:
             for profile in profiles:
                 self.delete_profile_record(profile)
-            self.status.set("已恢复并清理全部记录。")
+            self.status.set("\u5df2\u6062\u590d\u5e76\u6e05\u7406\u5168\u90e8\u8bb0\u5f55\u3002")
             self.refresh_profiles()
         except OSError as exc:
-            messagebox.showerror("删除失败", str(exc), parent=self)
+            messagebox.showerror("\u5220\u9664\u5931\u8d25", str(exc), parent=self)
 
     def enable_drag_drop(self) -> None:
         """Use TkDND rather than replacing Tk's window procedure (stable with Explorer drops)."""
