@@ -1,4 +1,4 @@
-﻿"""轻量、无害的全屏蓝屏风格计时器与 .lnk 备份/恢复管理器。
+"""轻量、无害的全屏蓝屏风格计时器与 .lnk 备份/恢复管理器。
 
 仅适用于 Windows。它不会触发真实系统蓝屏或修改系统设置。
 """
@@ -19,13 +19,6 @@ import uuid
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from tkinterdnd2 import DND_FILES, TkinterDnD
-
-try:
-    from win32com.client import Dispatch
-    import pythoncom
-    from PIL import Image, ImageDraw, ImageTk
-except ImportError as exc:
-    raise SystemExit("需要 pywin32 和 Pillow。请运行: pip install pywin32 pillow") from exc
 
 IS_FROZEN = bool(getattr(sys, "frozen", False))
 APP_DIR = (Path(sys.executable) if IS_FROZEN else Path(__file__)).resolve().parent
@@ -115,6 +108,8 @@ def all_profiles() -> list[dict]:
 
 
 def shortcut_data(path: Path) -> dict:
+    from win32com.client import Dispatch
+
     shell = Dispatch("WScript.Shell")
     shortcut = shell.CreateShortcut(str(path))
     return {
@@ -173,6 +168,8 @@ def launcher_runtime() -> Path:
 
 def configure_launcher(link_path: Path, profile_id: str, icon_location: str) -> None:
     """Configure a .lnk file as the local, no-console launcher."""
+    from win32com.client import Dispatch
+
     shell = Dispatch("WScript.Shell")
     link = shell.CreateShortcut(str(link_path))
     link.Targetpath = str(launcher_runtime())
@@ -327,19 +324,24 @@ def tk_hotkey(value: str) -> str:
     return "<" + "-".join(modifiers + [key]) + ">"
 
 
-def build_qr_image(size: int = 132) -> Image.Image:
-    """A deterministic QR-like visual block; no scanning purpose or external dependency."""
+def build_qr_image(size: int = 132) -> tk.PhotoImage:
+    """Build the decorative QR-like block with Tk itself (no Pillow startup cost)."""
     modules = 29
     pad = 4
     cell = max(1, (size - pad * 2) // modules)
     actual = cell * modules + pad * 2
-    image = Image.new("RGB", (actual, actual), "white")
-    draw = ImageDraw.Draw(image)
+    image = tk.PhotoImage(width=actual, height=actual)
+    image.put("white", to=(0, 0, actual, actual))
+
+    def fill(x: int, y: int, width: int, height: int, color: str) -> None:
+        x0 = pad + x * cell
+        y0 = pad + y * cell
+        image.put(color, to=(x0, y0, x0 + width * cell, y0 + height * cell))
 
     def finder(x: int, y: int) -> None:
-        draw.rectangle((pad + x*cell, pad + y*cell, pad + (x+7)*cell-1, pad + (y+7)*cell-1), fill="black")
-        draw.rectangle((pad + (x+1)*cell, pad + (y+1)*cell, pad + (x+6)*cell-1, pad + (y+6)*cell-1), fill="white")
-        draw.rectangle((pad + (x+2)*cell, pad + (y+2)*cell, pad + (x+5)*cell-1, pad + (y+5)*cell-1), fill="black")
+        fill(x, y, 7, 7, "black")
+        fill(x + 1, y + 1, 5, 5, "white")
+        fill(x + 2, y + 2, 3, 3, "black")
 
     blocked = set()
     for x, y in ((0, 0), (modules - 7, 0), (0, modules - 7)):
@@ -355,7 +357,7 @@ def build_qr_image(size: int = 132) -> Image.Image:
             # A stable pseudo-random matrix makes the block look like the standard stop-code QR area.
             bit = ((x * 17 + y * 31 + (x * y) * 7 + seed) ^ (x << 2) ^ (y << 1)) & 1
             if bit:
-                draw.rectangle((pad+x*cell, pad+y*cell, pad+(x+1)*cell-1, pad+(y+1)*cell-1), fill="black")
+                fill(x, y, 1, 1, "black")
     return image
 
 
@@ -427,7 +429,7 @@ class BsodWindow:
             self.progress_label.pack(anchor="w", pady=(int(28 * scale), int(63 * scale)))
             detail = tk.Frame(content, bg=bg)
             detail.pack(anchor="w")
-            qr = ImageTk.PhotoImage(build_qr_image(max(112, int(154 * scale))))
+            qr = build_qr_image(max(112, int(154 * scale)))
             self.root._qr_ref = qr
             tk.Label(detail, image=qr, bg="white", bd=0).pack(side="left", padx=(0, int(28 * scale)))
             tk.Label(detail, text=detail_text, fg="white", bg=bg, justify="left", anchor="w",
@@ -671,6 +673,8 @@ class ShortcutManager(TkinterDnD.Tk):
         threading.Thread(target=self._take_over_task, args=(path, is_shortcut, settings), daemon=True).start()
 
     def _take_over_task(self, path: Path, is_shortcut: bool, settings: dict) -> None:
+        import pythoncom
+
         pythoncom.CoInitialize()
         profile_id = uuid.uuid4().hex
         backup_dir = BACKUPS_DIR / profile_id

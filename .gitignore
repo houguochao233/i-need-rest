@@ -1,8 +1,7 @@
-﻿# Runtime data and local backups created by the app
+# Runtime data and local backups created by the app
 data/
 __pycache__/
 *.pyc
 # PyInstaller build output
 build/
 dist/
-

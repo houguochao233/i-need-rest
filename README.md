@@ -1,4 +1,4 @@
-﻿<div align="center">
+<div align="center">
 
 # I Need Rest
 
@@ -29,9 +29,11 @@
 
 ## 📦 下载运行
 
-前往仓库的 [Releases](https://github.com/houguochao233/i-need-rest/releases) 页面，下载最新版本的 `I-Need-Rest.exe`。
+前往仓库的 [Releases](https://github.com/houguochao233/i-need-rest/releases) 页面，优先下载最新版本的 `I-Need-Rest-portable.zip`。
 
-首次运行时建议将 EXE 放到一个不会被随意移动的文件夹中。程序会在 EXE 同目录创建 `data` 文件夹，用来保存备份和恢复记录。
+解压后双击文件夹内的 `I-Need-Rest.exe`，不要只把 EXE 单独拿出来。首次运行时建议将整个程序文件夹放到一个不会被随意移动的位置；程序会在 EXE 同目录创建 `data` 文件夹，用来保存备份和恢复记录。
+
+> 当前发布采用便携目录版，而不是单文件 EXE。单文件版每次启动都要先解压完整运行环境，并可能触发 Windows Defender 的重复扫描；便携目录版不需要重复解压，启动更快。
 
 > Windows 可能因为未知发布者提示安全警告。这是未购买代码签名证书的个人开源项目，请确认文件来自本仓库 Release 后再运行。
 
@@ -59,7 +61,6 @@
 - Windows 7 / 10 / 11
 - Python 3.11 或更高版本
 - `pywin32`
-- `Pillow`
 - `tkinterdnd2`
 
 ### 安装依赖
@@ -86,11 +87,11 @@ python -m pip install pyinstaller
 生成文件：
 
 ```text
-dist\I-Need-Rest.exe
+dist\I-Need-Rest\I-Need-Rest.exe
+dist\I-Need-Rest-portable.zip
 ```
 
-构建使用 `--windowed --onefile`，不弹出控制台窗口，并自动收集拖拽组件 `tkinterdnd2` 所需文件。
-
+构建使用 `--windowed --onedir`，不弹出控制台窗口，并自动收集拖拽组件 `tkinterdnd2` 所需文件。便携 ZIP 需要整体解压后运行，不能只提取其中的 EXE。
 ## 📖 使用方式
 
 1. 启动 **I Need Rest**。
@@ -171,7 +172,8 @@ python -m py_compile .\bsod_shortcut.py .\desktop_icon_positions.py
 
 ```text
 bsod_shortcut.py          主程序、GUI、蓝屏界面、文件接管与恢复
-desktop_icon_positions.py 桌面位置模块（当前版本暂不启用）build.ps1                 PyInstaller 打包脚本
+desktop_icon_positions.py 桌面位置模块（当前版本暂不启用）
+build.ps1                 Windows 便携版打包脚本
 I-Need-Rest.spec          PyInstaller 构建配置
 requirements.txt          Python 依赖
 TECHNICAL_HANDOFF.md      技术交接文档
