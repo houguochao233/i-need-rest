@@ -145,7 +145,7 @@ python -m py_compile .\bsod_shortcut.py .\desktop_icon_positions.py
 
 ```text
 bsod_shortcut.py          主程序、GUI、蓝屏界面、文件接管与恢复
- desktop_icon_positions.py 桌面位置模块（当前版本暂不启用）
+desktop_icon_positions.py 桌面位置模块（当前版本暂不启用）
  requirements.txt          Python 依赖
  TECHNICAL_HANDOFF.md      技术交接文档
  data/                     运行时备份和记录，不上传到仓库
